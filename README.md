@@ -20,11 +20,11 @@ Run either script with the project environment active:
 
 ```bash
 julia --project=. simple_cpu.jl
-julia --project=. 2D_excitation.jl
+julia --project=. 2d_excitation.jl
 ```
 
 - **[`simple_cpu.jl`](simple_cpu.jl)** — 1-D slice-selective RF design on the CPU. Optimizes a complex RF pulse against a target slice profile using `KomaMRICore` + Enzyme. Minimal end-to-end example.
-- **[`2D_excitation.jl`](2D_excitation.jl)** — 2-D selective excitation with a spiral k-space trajectory. Optimizes a complex RF pulse to produce a target 2-D image. Choose a backend via `main(backend=…)`:
+- **[`2d_excitation.jl`](2d_excitation.jl)** — 2-D selective excitation with a spiral k-space trajectory. Optimizes a complex RF pulse to produce a target 2-D image. Choose a backend via `main(backend=…)`:
   - `:cpu` — Reactant CPU
   - `:reactant_gpu` — Reactant CUDA
   - `:cuda` — native KernelAbstractions + Enzyme CUDA
