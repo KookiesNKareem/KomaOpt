@@ -1,3 +1,5 @@
 *.png
 .vscode/
 Manifest.toml
+*.jld2
+*.seq

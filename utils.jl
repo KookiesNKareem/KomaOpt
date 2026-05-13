@@ -204,7 +204,7 @@ function discretize_timeline(seq, sim_params; rf_threshold=1f-10)
         Gz = Float32.(seqd.Gz[1:Nt]),
         Δt = Δt_raw,
         Δf = Float32.(seqd.Δf[1:Nt]),
-        t  = Float32.(seqd.t[1:Nt]),
+        t = Float32.(seqd.t[1:Nt]),
         Nt32 = Int32(Nt),
         rf_active_idx = findall(b1 -> abs(b1) > rf_threshold, B1),
     )
@@ -229,14 +229,14 @@ function bloch_forward_reactant!(
     ::Val{N_Δt}
 ) where {N_Δt}
     neg_pi_gamma_local = Float32(-π * γ_Hz)
-    inv_γ_rad          = 1.0f0 / Float32(γ_rad)
+    inv_γ_rad = 1.0f0 / Float32(γ_rad)
 
     @trace for s_idx in 1:N_Δt
         Bz = @. p_x * s_Gx[s_idx] + p_y * s_Gy[s_idx] + p_z * s_Gz[s_idx] +
                 p_ΔBz - s_Δf[s_idx] * inv_γ_rad
         B1_r = s_B1_r[s_idx]
         B1_i = s_B1_i[s_idx]
-        Δt   = s_Δt[s_idx]
+        Δt = s_Δt[s_idx]
 
         B = @. sqrt(B1_r^2 + B1_i^2 + Bz^2) + 1f-20
         φ = @. neg_pi_gamma_local * B * Δt
@@ -264,7 +264,7 @@ function bloch_forward_reactant!(
         ΔT2 = @. exp(-Δt / p_T2)
         M_xy_r = @. Mxy_new_r * ΔT2
         M_xy_i = @. Mxy_new_i * ΔT2
-        M_z    = @. Mz_new * ΔT1 + p_ρ * (1f0 - ΔT1)
+        M_z = @. Mz_new * ΔT1 + p_ρ * (1f0 - ΔT1)
     end
 
     return M_xy_r, M_xy_i, M_z
@@ -279,7 +279,7 @@ function reactant_loss_mxy(
 ) where {N_Δt}
     M_xy_r = zero(p_x)
     M_xy_i = zero(p_x)
-    M_z    = one.(p_x)
+    M_z = one.(p_x)
 
     M_xy_r, M_xy_i, M_z = bloch_forward_reactant!(
         M_xy_r, M_xy_i, M_z,
@@ -314,6 +314,51 @@ function reactant_grad_and_loss_mxy(
     return val, derivs[1], derivs[2]
 end
 
+# Mz-target loss for Reactant compilation. Applies T1 recovery `E1 = exp(-T_delay/T1)`
+# to M_z before computing the loss: M_z_delayed = M_z * E1 + ρ * (1 - E1).
+function reactant_loss_mz(
+    B1_r_tl, B1_i_tl,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
+    target_z, mask, invN, E1_delay,
+    ::Val{N_Δt}
+) where {N_Δt}
+    M_xy_r = zero(p_x)
+    M_xy_i = zero(p_x)
+    M_z = one.(p_x)
+
+    M_xy_r, M_xy_i, M_z = bloch_forward_reactant!(
+        M_xy_r, M_xy_i, M_z,
+        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+        s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
+        B1_r_tl, B1_i_tl, Val(N_Δt))
+
+    M_z_delayed = @. M_z * E1_delay + p_ρ * (1f0 - E1_delay)
+    d = @. (M_z_delayed - target_z) * mask
+    return sum(@. invN * d^2)
+end
+
+function reactant_grad_and_loss_mz(
+    B1_r_tl, B1_i_tl,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
+    target_z, mask, invN, E1_delay,
+    ::Val{N_Δt}
+) where {N_Δt}
+    (; val, derivs) = gradient(
+        ReverseWithPrimal,
+        reactant_loss_mz,
+        B1_r_tl, B1_i_tl,
+        Const(p_x), Const(p_y), Const(p_z),
+        Const(p_ΔBz), Const(p_T1), Const(p_T2),
+        Const(p_ρ),
+        Const(s_Gx), Const(s_Gy), Const(s_Gz),
+        Const(s_Δt), Const(s_Δf),
+        Const(target_z), Const(mask), Const(invN), Const(E1_delay),
+        Const(Val(N_Δt)))
+    return val, derivs[1], derivs[2]
+end
+
 function reactant_forward(
     B1_r_tl, B1_i_tl,
     p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
@@ -322,7 +367,7 @@ function reactant_forward(
 ) where {N_Δt}
     M_xy_r = zero(p_x)
     M_xy_i = zero(p_x)
-    M_z    = one.(p_x)
+    M_z = one.(p_x)
 
     M_xy_r, M_xy_i, M_z = bloch_forward_reactant!(
         M_xy_r, M_xy_i, M_z,
@@ -334,6 +379,14 @@ function reactant_forward(
 end
 
 # Reactant setup: compiles forward + grad pipelines and returns CPU-facing closures.
+"""
+    setup_reactant_backend(; Nspins, n_ctrl, TL, rf_idx, spin, target, mask, invN,
+                            loss_mode=:mxy, interp=nothing, csr=nothing, E1_delay=nothing)
+
+Compile forward + grad pipelines via Reactant. `loss_mode=:mxy` uses a complex Mxy
+target; `:mz` uses a real Mz target plus a per-spin `E1_delay = exp(-T_delay/T1)`
+for post-pulse T1 recovery (defaults to no recovery).
+"""
 function setup_reactant_backend(;
     Nspins::Int,
     n_ctrl::Int,
@@ -343,8 +396,10 @@ function setup_reactant_backend(;
     target,
     mask::Vector{Float32},
     invN::Float32,
+    loss_mode::Symbol = :mxy,
     interp = nothing,
     csr = nothing,
+    E1_delay = nothing,
 )
     Nt = Int(TL.Nt32)
     N_Δt_val = Val(Nt)
@@ -356,13 +411,13 @@ function setup_reactant_backend(;
         csr = build_csr_gather_tables(n_ctrl, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
     end
 
-    p_x_ra  = Reactant.to_rarray(Float32.(spin.p_x))
-    p_y_ra  = Reactant.to_rarray(Float32.(spin.p_y))
-    p_z_ra  = Reactant.to_rarray(Float32.(spin.p_z))
+    p_x_ra = Reactant.to_rarray(Float32.(spin.p_x))
+    p_y_ra = Reactant.to_rarray(Float32.(spin.p_y))
+    p_z_ra = Reactant.to_rarray(Float32.(spin.p_z))
     p_ΔBz_ra = Reactant.to_rarray(Float32.(spin.p_ΔBz))
     p_T1_ra = Reactant.to_rarray(Float32.(spin.p_T1))
     p_T2_ra = Reactant.to_rarray(Float32.(spin.p_T2))
-    p_ρ_ra  = Reactant.to_rarray(Float32.(spin.p_ρ))
+    p_ρ_ra = Reactant.to_rarray(Float32.(spin.p_ρ))
 
     Gx_ra = Reactant.to_rarray(Float32.(TL.Gx))
     Gy_ra = Reactant.to_rarray(Float32.(TL.Gy))
@@ -370,19 +425,38 @@ function setup_reactant_backend(;
     Δt_ra = Reactant.to_rarray(Float32.(TL.Δt))
     Δf_ra = Reactant.to_rarray(Float32.(TL.Δf))
 
-    B1_r_ra    = Reactant.to_rarray(zeros(Float32, Nt))
-    B1_i_ra    = Reactant.to_rarray(zeros(Float32, Nt))
-    mask_ra    = Reactant.to_rarray(Float32.(mask))
-    target_r_ra = Reactant.to_rarray(Float32.(real.(target)))
-    target_i_ra = Reactant.to_rarray(Float32.(imag.(target)))
+    B1_r_ra = Reactant.to_rarray(zeros(Float32, Nt))
+    B1_i_ra = Reactant.to_rarray(zeros(Float32, Nt))
+    mask_ra = Reactant.to_rarray(Float32.(mask))
 
-    @info "Compiling Reactant Mxy grad_and_loss..."
-    compiled_gl = Reactant.@compile sync=true reactant_grad_and_loss_mxy(
-        B1_r_ra, B1_i_ra,
-        p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra,
-        Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra,
-        target_r_ra, target_i_ra, mask_ra, invN,
-        N_Δt_val)
+    if loss_mode == :mz
+        E1_arr = isnothing(E1_delay) ? ones(Float32, Nspins) : Float32.(E1_delay)
+        E1_ra = Reactant.to_rarray(E1_arr)
+        target_z_ra = Reactant.to_rarray(Float32.(target))
+
+        @info "Compiling Reactant Mz grad_and_loss..."
+        compiled_gl = Reactant.@compile sync=true reactant_grad_and_loss_mz(
+            B1_r_ra, B1_i_ra,
+            p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra,
+            Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra,
+            target_z_ra, mask_ra, invN, E1_ra,
+            N_Δt_val)
+        target_tuple = (target_z_ra, mask_ra, invN, E1_ra)
+    elseif loss_mode == :mxy
+        target_r_ra = Reactant.to_rarray(Float32.(real.(target)))
+        target_i_ra = Reactant.to_rarray(Float32.(imag.(target)))
+
+        @info "Compiling Reactant Mxy grad_and_loss..."
+        compiled_gl = Reactant.@compile sync=true reactant_grad_and_loss_mxy(
+            B1_r_ra, B1_i_ra,
+            p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra,
+            Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra,
+            target_r_ra, target_i_ra, mask_ra, invN,
+            N_Δt_val)
+        target_tuple = (target_r_ra, target_i_ra, mask_ra, invN)
+    else
+        error("Unknown loss_mode=$loss_mode. Use :mxy or :mz")
+    end
 
     compiled_fwd = Reactant.@compile sync=true reactant_forward(
         B1_r_ra, B1_i_ra,
@@ -393,12 +467,11 @@ function setup_reactant_backend(;
 
     B1_r_tl = zeros(Float32, Nt)
     B1_i_tl = zeros(Float32, Nt)
-    gx_buf  = zeros(Float32, n_ctrl)
-    gi_buf  = zeros(Float32, n_ctrl)
+    gx_buf = zeros(Float32, n_ctrl)
+    gi_buf = zeros(Float32, n_ctrl)
 
-    spin_ra      = (p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra)
-    seq_ra       = (Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra)
-    target_tuple = (target_r_ra, target_i_ra, mask_ra, invN)
+    spin_ra = (p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra)
+    seq_ra = (Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra)
 
     function grad_fn!(x_r::Vector{Float32}, x_i::Vector{Float32})
         map_ctrl_to_timeline_cpu!(B1_r_tl, B1_i_tl, x_r, x_i, interp)
@@ -447,7 +520,7 @@ function bb_optimize!(
     T = eltype(x_r_d)
     loss_history = zeros(Float64, Niters)
 
-    gx_prev_d  = similar(gx_d);  gi_prev_d  = similar(gi_d)
+    gx_prev_d = similar(gx_d);  gi_prev_d = similar(gi_d)
     fill!(gx_prev_d, zero(T));   fill!(gi_prev_d, zero(T))
     x_prev_r_d = similar(x_r_d); x_prev_i_d = similar(x_i_d)
     copyto!(x_prev_r_d, x_r_d);  copyto!(x_prev_i_d, x_i_d)
@@ -521,7 +594,8 @@ end
     @Const(s_Δt), @Const(s_Δf),
     s_B1::AbstractVector{Complex{T}},
     N_Δt,
-) where {T}
+    ::Val{MOTION},
+) where {T, MOTION}
     @uniform N = @groupsize()[1]
     i_l = @index(Local, Linear)
     i_g = @index(Group, Linear)
@@ -568,12 +642,12 @@ end
             ΔT1 = exp(-Δt / T1); ΔT2 = exp(-Δt / T2)
             Mxy_r = Mxy_new_r * ΔT2
             Mxy_i = Mxy_new_i * ΔT2
-            Mz    = Mz_new * ΔT1 + ρ * (T(1) - ΔT1)
+            Mz = Mz_new * ΔT1 + ρ * (T(1) - ΔT1)
 
             s_idx += Int32(1)
         end
         M_xy[i] = complex(Mxy_r, Mxy_i)
-        M_z[i]  = Mz
+        M_z[i] = Mz
     end
 end
 
@@ -583,11 +657,15 @@ Base.@noinline function excite_only!(
     p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
     N_Spins::Int32,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1,
-    N_Δt::Int32, backend, group_size::Int = 256,
-)
-    excitation_kernel!(backend, group_size)(
+    N_Δt::Int32,
+    motion::Val{MOTION},
+    backend,
+    group_size::Int = 256,
+) where {MOTION}
+    kernel = excitation_kernel!(backend, group_size)
+    kernel(
         M_xy, M_z, p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
-        N_Spins, s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1, N_Δt;
+        N_Spins, s_Gx, s_Gy, s_Gz, s_Δt, s_Δf, s_B1, N_Δt, motion;
         ndrange = Int(N_Spins))
     return nothing
 end
@@ -603,7 +681,7 @@ end
     k = Int32(@index(Global, Linear))
     if k <= Int32(length(idx_rf))
         idx = Int32(idx_rf[k])
-        j0  = Int32(jlo[k]); j1 = Int32(jhi[k])
+        j0 = Int32(jlo[k]); j1 = Int32(jhi[k])
         vr = sgn_r * (w0[k] * x_r[j0] + w1[k] * x_r[j1])
         vi = sgn_i * (w0[k] * x_i[j0] + w1[k] * x_i[j1])
         out_B1[idx] = Complex{T}(vr, vi)
@@ -650,6 +728,25 @@ end
     end
 end
 
+# MSE-on-Mz loss + adjoint seed. Seed `dM_z` only; caller pre-applies any T1 recovery to M_z.
+@kernel inbounds=true function seed_and_loss_z_kernel!(
+    acc::AbstractVector{T},
+    dM_z::AbstractVector{T},
+    M_z::AbstractVector{T},
+    @Const(target_z), @Const(mask),
+    invN::T,
+) where {T<:AbstractFloat}
+    i = Int32(@index(Global, Linear))
+    N = Int32(length(mask))
+    if i <= N
+        m = M_z[i]; t = target_z[i]
+        d = m - t
+        w = mask[i] * invN
+        @KA.atomic acc[1] += w * d^2
+        dM_z[i] = T(2) * w * d
+    end
+end
+
 # --- BlochSetup: bundles device buffers for forward + Enzyme reverse --------
 struct BlochSetup{T}
     M_xy::AbstractVector{Complex{T}}
@@ -679,18 +776,18 @@ end
 # Upload host interp/csr tables (which are Int/Float64) as Int32/Float32.
 function setup_control_mapping_device(n_ctrl::Int, rf_idx, to_device)
     interp = build_interpolation_tables(n_ctrl, rf_idx)
-    csr    = build_csr_gather_tables(n_ctrl, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
+    csr = build_csr_gather_tables(n_ctrl, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
     return (
         interp_tables = interp,
-        csr_tables    = csr,
-        j_lo_d   = to_device(Int32.(interp.j_lo)),
-        j_hi_d   = to_device(Int32.(interp.j_hi)),
-        w0_d     = to_device(Float32.(interp.w0)),
-        w1_d     = to_device(Float32.(interp.w1)),
+        csr_tables = csr,
+        j_lo_d = to_device(Int32.(interp.j_lo)),
+        j_hi_d = to_device(Int32.(interp.j_hi)),
+        w0_d = to_device(Float32.(interp.w0)),
+        w1_d = to_device(Float32.(interp.w1)),
         idx_rf_d = to_device(Int32.(interp.idx_rf)),
         csr_ptr_d = to_device(Int32.(csr.ptr)),
         csr_idx_d = to_device(Int32.(csr.idx)),
-        csr_w_d   = to_device(Float32.(csr.w)),
+        csr_w_d = to_device(Float32.(csr.w)),
     )
 end
 
@@ -741,7 +838,7 @@ function grad_and_loss!(bs::BlochSetup, x_r_d, x_i_d, seed_fn!;
     excite_only!(bs.M_xy, bs.M_z,
         bs.p_x, bs.p_y, bs.p_z, bs.p_ΔBz, bs.p_T1, bs.p_T2, bs.p_ρ,
         bs.Nspins, bs.s_Gx, bs.s_Gy, bs.s_Gz, bs.s_Δt, bs.s_Δf, bs.s_B1,
-        bs.N_Δt, bs.backend, bs.group_size)
+        bs.N_Δt, Val(false), bs.backend, bs.group_size)
 
     fill!(bs.acc_loss_d, 0f0)
     fill!(bs.dM_xy, ComplexF32(0)); fill!(bs.dM_z, 0f0)
@@ -762,8 +859,8 @@ function grad_and_loss!(bs::BlochSetup, x_r_d, x_i_d, seed_fn!;
         Enzyme.Const(bs.s_Δt), Enzyme.Const(bs.s_Δf),
         Enzyme.Duplicated(bs.s_B1, bs.∇B1),
         Enzyme.Const(bs.N_Δt),
+        Enzyme.Const(Val(false)),
         Enzyme.Const(bs.backend),
-        Enzyme.Const(bs.group_size),
     )
 
     fill!(bs.gx_d, 0f0); fill!(bs.gi_d, 0f0)
@@ -785,7 +882,7 @@ function forward_sim!(bs::BlochSetup, x_r_d, x_i_d;
     excite_only!(bs.M_xy, bs.M_z,
         bs.p_x, bs.p_y, bs.p_z, bs.p_ΔBz, bs.p_T1, bs.p_T2, bs.p_ρ,
         bs.Nspins, bs.s_Gx, bs.s_Gy, bs.s_Gz, bs.s_Δt, bs.s_Δf, bs.s_B1,
-        bs.N_Δt, bs.backend, bs.group_size)
+        bs.N_Δt, Val(false), bs.backend, bs.group_size)
     KA.synchronize(bs.backend)
     return Array(bs.M_xy), Array(bs.M_z)
 end

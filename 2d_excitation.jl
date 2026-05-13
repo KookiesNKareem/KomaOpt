@@ -34,10 +34,10 @@ function _run_reactant_pipeline(; Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
         spin=spin_params, target=target_profile, mask=mask_f32, invN=INVN,
         interp=interp_h, csr=csr_h)
 
-    grad_fn!   = reactant_ctx.grad_fn!
+    grad_fn! = reactant_ctx.grad_fn!
     forward_fn = reactant_ctx.forward_fn
-    gx_buf     = reactant_ctx.gx_buf
-    gi_buf     = reactant_ctx.gi_buf
+    gx_buf = reactant_ctx.gx_buf
+    gi_buf = reactant_ctx.gi_buf
 
     x_r = zeros(Float32, Nrf)
     x_i = zeros(Float32, Nrf)
@@ -74,13 +74,13 @@ function _run_cuda_pipeline(; Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
         to_device=adapt_dev, backend=ka_backend, group_size)
 
     target_d = adapt_dev(ComplexF32.(target_profile))
-    mask_d   = adapt_dev(mask_f32)
+    mask_d = adapt_dev(mask_f32)
 
     seed_mxy! = (b) -> seed_and_loss_kernel!(b.backend, b.group_size)(
         b.acc_loss_d, b.dM_xy, b.M_xy, target_d, mask_d, INVN;
         ndrange = Int(b.Nspins))
 
-    grad_fn!   = (xr, xi) -> grad_and_loss!(bs, xr, xi, seed_mxy!)
+    grad_fn! = (xr, xi) -> grad_and_loss!(bs, xr, xi, seed_mxy!)
     forward_fn = (xr, xi) -> begin
         Mr, _ = forward_sim!(bs, adapt_dev(xr), adapt_dev(xi))
         return ComplexF32.(Mr), nothing
@@ -113,7 +113,6 @@ function main(; backend::Symbol = :cuda, img_path::String = "target_images/stanf
 
     Nrf = 350
     seq, Trf = build_spiral_sequence(; Nrf)
-    mkpath("Results")
 
     seq.ADC[1].N = 0
 
@@ -174,7 +173,7 @@ function main(; backend::Symbol = :cuda, img_path::String = "target_images/stanf
     seq.RF[1].A .= x_opt
 
     stem = splitext(basename(img_path))[1]
-    outdir = joinpath("Results", stem)
+    outdir = joinpath("pulses", stem)
     mkpath(outdir)
 
     t_ms = collect(range(0, Trf, Nrf)) .* 1e3

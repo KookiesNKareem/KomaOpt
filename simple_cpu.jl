@@ -9,6 +9,7 @@ import KernelAbstractions as KA
 import Enzyme
 using Random: seed!
 using CairoMakie
+using JLD2: jldsave
 include("utils.jl")
 
 # Pre-built structs in args — avoids Const→Duplicated stores inside the AD region.
@@ -168,14 +169,28 @@ function main()
 
     fig = Figure(size=(800, 600))
     ax1 = Axis(fig[1, 1], xlabel="t (ms)", ylabel="B1 (µT)", title="Optimized RF Pulse")
-    lines!(ax1, t_ms, x_r .* 1e6, label="Re(B1)")
-    lines!(ax1, t_ms, x_i .* 1e6, label="Im(B1)")
-    axislegend(ax1)
+    lines!(ax1, t_ms, x_r .* 1e6, color=:blue, label="Real")
+    lines!(ax1, t_ms, x_i .* 1e6, color=:red,  label="Imag")
+    axislegend(ax1, position=:rt)
     ax2 = Axis(fig[2, 1], xlabel="z (mm)", ylabel="|Mxy|", title="Slice Profile")
-    lines!(ax2, z_mm, mag_achieved, label="Achieved")
-    lines!(ax2, z_mm, target_mag, linestyle=:dash, label="Target")
-    axislegend(ax2)
+    lines!(ax2, z_mm, mag_achieved, color=:blue, label="Achieved")
+    lines!(ax2, z_mm, target_mag, color=:black, linestyle=:dash, label="Target")
+    axislegend(ax2, position=:rt)
+
+    outdir = "pulses/simple_cpu"
+    mkpath(outdir)
+    save(joinpath(outdir, "simple_cpu.png"), fig, px_per_unit=4)
     display(fig)
+
+    Δt_rf = 10e-6
+    seq.RF[1].A .= ComplexF32.(x_r .+ im .* x_i)
+    T_seq = (dur(seq) ÷ Δt_rf) * Δt_rf
+    t_grid = collect(range(0, T_seq, step=Δt_rf))
+    B1 = KomaMRIBase.get_rfs(seq, t_grid)[1]
+    Grads = KomaMRIBase.get_grads(seq, t_grid)
+    jldsave(joinpath(outdir, "simple_cpu.jld2");
+            B1=B1, Gx=Grads[1], Gy=Grads[2], T=T_seq, seq)
+    @info "Saved pulse to $outdir"
 end
 
 main()
