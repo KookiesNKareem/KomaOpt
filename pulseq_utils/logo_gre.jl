@@ -1,4 +1,5 @@
-using KomaMRI
+using KomaMRIBase
+using KomaMRIFiles: write_seq
 using JLD2
 
 include("gre.jl")
