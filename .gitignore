@@ -1,5 +1,7 @@
 *.png
+!targets/*.png
 .vscode/
 Manifest.toml
 *.jld2
 *.seq
+experiments/
