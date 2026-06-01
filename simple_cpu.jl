@@ -4,13 +4,16 @@ using Pkg
 Pkg.activate(".")
 Pkg.instantiate()
 
-using KomaMRICore, KomaMRIBase, Suppressor
+using KomaMRICore, KomaMRIBase
 import KernelAbstractions as KA
 import Enzyme
 using Random: seed!
 using CairoMakie
 using JLD2: jldsave
 include("utils.jl")
+
+# KomaMRICore's BlochSimple path currently trips Enzyme's strict alias analysis.
+Enzyme.API.strictAliasing!(false)
 
 # Pre-built structs in args — avoids Const→Duplicated stores inside the AD region.
 function loss!(M_xy::AbstractVector{ComplexF64}, M_z::AbstractVector{Float64},
@@ -69,8 +72,6 @@ function main()
     sim_params["sim_method"] = KomaMRICore.Bloch()
     sim_params["Nthreads"] = 1
     sim_params["gpu"] = false
-
-    mag_ref = @suppress simulate(obj, seq, sys; sim_params)
 
     seqd = KomaMRICore.discretize(seq; sampling_params=sim_params)
     Nt = length(seqd.Δt)

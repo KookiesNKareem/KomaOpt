@@ -30,7 +30,7 @@ julia --project=. off_resonance.jl
 - **[`fatsat.jl`](fatsat.jl)** — Fat-saturation RF pulse design (T1-aware). Optimizes a frequency-selective pulse against a Butterworth or Gaussian target Mz profile, with a post-pulse delay accounted for. Also runs a naive (T1=∞) optimization and a Gaussian reference for the comparison figure. Backend via the `BACKEND` const at the top.
 - **[`off_resonance.jl`](off_resonance.jl)** — 2-D excitation with B0 inhomogeneity. Loads a B0 map (DICOM, a Hz-file image/JLD2, or a synthetic Gaussian bump), then runs two optimizations — a B0-ignorant one and a B0-aware one — and forward-evaluates both against the true field. Backend via the `BACKEND` const at the top.
 
-All four scripts share the same three-backend menu:
+The backend-selectable scripts default to `:cpu`, which is Reactant CPU. Their backend menu is:
 
 - `:cpu` — Reactant CPU
 - `:reactant_gpu` — Reactant CUDA

@@ -249,7 +249,7 @@ make_spin_params(ΔBz) = (
     p_ρ = ones(Float32, Nspins),
 )
 
-img_path = "target_images/stanford_logo.png"
+img_path = "targets/stanford_logo.png"
 target_profile, mag_target_2d = load_image_target(img_path, Nspins_x, Nspins_y)
 
 INVN = inv(Float32(Nspins))

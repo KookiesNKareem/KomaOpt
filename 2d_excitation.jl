@@ -104,7 +104,7 @@ function _run_cuda_pipeline(; Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
     return x_opt, M_xy_achieved, loss_history, performed_iterations
 end
 
-function main(; backend::Symbol = :cuda, img_path::String = "target_images/stanford_logo.png")
+function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_logo.png")
     if backend in (:cpu, :reactant_gpu)
         Reactant.set_default_backend(backend == :cpu ? "cpu" : "cuda")
     elseif backend != :cuda
