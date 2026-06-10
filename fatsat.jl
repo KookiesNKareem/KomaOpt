@@ -2,8 +2,9 @@
 # backend ∈ (:cpu, :cuda, :reactant_gpu).
 
 const BACKEND = :cpu
+const SHOW_FIGURES = isinteractive()
 
-include("utils.jl")
+include(joinpath(@__DIR__, "utils.jl"))
 
 if BACKEND == :cuda
     using CUDA
@@ -86,7 +87,7 @@ const spin_params = (
     p_ρ = ones(Float32, Nspins),
 )
 const E1_delay_h = Float32.(exp.(-T_DELAY ./ spin_params.p_T1))
-const interp_h = build_interpolation_tables(n_ctrl, rf_idx)
+const interp_h = build_rf_event_interpolation_tables(seq, TL, n_ctrl, rf_idx)
 const csr_h = build_csr_gather_tables(n_ctrl, interp_h.j_lo, interp_h.j_hi, interp_h.w0, interp_h.w1)
 
 const fat_center = Float32(FAT_FREQ)
@@ -152,6 +153,7 @@ function setup_backend(; spin, target_mz, E1_delay, with_delay::Bool)
 
         bs = init_bloch_setup(;
             Nspins, n_ctrl, TL, rf_idx, spin,
+            interp=interp_h, csr=csr_h,
             to_device=adapt_dev, backend=ka_backend, group_size=GROUP_SIZE)
 
         target_d = adapt_dev(target_mz)
@@ -248,7 +250,7 @@ x_opt_naive, naive_loss_history, naive_n_iters = optimize_pulse(ctx_naive; label
 freq_hz = freq_offsets
 t_ms = collect(range(0, Trf, n_ctrl)) .* 1e3
 
-outdir = "pulses/fatsat"
+outdir = joinpath(@__DIR__, "pulses", "fatsat")
 mkpath(outdir)
 
 fig = Figure(size=(800, 600))
@@ -266,7 +268,7 @@ lines!(ax2, t_ms, imag.(x_opt) .* 1e6, color=:red,  label="Imag")
 axislegend(ax2, position=:rt)
 
 save(joinpath(outdir, "fatsat_figure.png"), fig, px_per_unit=4)
-display(fig)
+SHOW_FIGURES && display(fig)
 @info "Saved $(joinpath(outdir, "fatsat_figure.png"))"
 
 # Comparison: Optimized (T1-aware) vs Naive vs Gaussian reference.
@@ -389,7 +391,7 @@ if GENERATE_COMPARISON_FIGURE
     axislegend(ax_o2, position=:rt)
 
     save(joinpath(outdir, "fatsat_comparison.png"), fig_comp, px_per_unit=4)
-    display(fig_comp)
+    SHOW_FIGURES && display(fig_comp)
     @info "Saved $(joinpath(outdir, "fatsat_comparison.png"))"
 end
 
@@ -421,7 +423,7 @@ if GENERATE_COMPARISON_FIGURE
     @info "Saved $(joinpath(outdir, "fatsat_gaussian.jld2"))"
 end
 
-include("pulseq_utils/preppulse_bSSFP.jl")
+include(joinpath(@__DIR__, "pulseq_utils", "preppulse_bSSFP.jl"))
 generate_bssfp_seq(joinpath(outdir, "fatsat_opt.jld2"), joinpath(outdir, "fatsat_opt.seq"))
 generate_bssfp_seq(joinpath(outdir, "fatsat_opt.jld2"), joinpath(outdir, "no_fatsat.seq"); disable_prep=true)
 if GENERATE_COMPARISON_FIGURE

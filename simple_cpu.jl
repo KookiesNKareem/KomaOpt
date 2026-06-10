@@ -1,7 +1,7 @@
 # 1-D slice-selective RF design via KomaMRICore + Enzyme reverse-mode AD.
 
 using Pkg
-Pkg.activate(".")
+Pkg.activate(@__DIR__)
 Pkg.instantiate()
 
 using KomaMRICore, KomaMRIBase
@@ -10,12 +10,12 @@ import Enzyme
 using Random: seed!
 using CairoMakie
 using JLD2: jldsave
-include("utils.jl")
+include(joinpath(@__DIR__, "utils.jl"))
 
 # KomaMRICore's BlochSimple path currently trips Enzyme's strict alias analysis.
 Enzyme.API.strictAliasing!(false)
 
-# Pre-built structs in args — avoids Const→Duplicated stores inside the AD region.
+# Pre-built structs in args avoids Const→Duplicated stores inside the AD region.
 function loss!(M_xy::AbstractVector{ComplexF64}, M_z::AbstractVector{Float64},
     seqd::DiscreteSequence{Float64},
     phantom::Phantom{Float64},
@@ -24,7 +24,8 @@ function loss!(M_xy::AbstractVector{ComplexF64}, M_z::AbstractVector{Float64},
 
     Nsp = length(M_xy)
     @inbounds for i in 1:Nsp
-        M_xy[i] = ComplexF64(0); M_z[i] = 1.0
+        M_xy[i] = ComplexF64(0)
+        M_z[i] = 1.0
     end
 
     M = KomaMRICore.Mag(M_xy, M_z)
@@ -34,18 +35,10 @@ function loss!(M_xy::AbstractVector{ComplexF64}, M_z::AbstractVector{Float64},
         BlochSimple(), 1, KA.CPU(), KomaMRICore.DefaultPrealloc{Float64}(),
     )
 
-    L = 0.0
-    # Loop, not broadcast: Enzyme + ComplexF64.
-    @inbounds for i in 1:Nsp
-        dr = real(M_xy[i])
-        di = imag(M_xy[i]) - target_mag[i]
-        L += 0.5 * (dr*dr + di*di) * invN
-    end
-    return L
+    return 0.5 * invN * sum(i -> abs2(@inbounds M_xy[i] - im*target_mag[i]), 1:Nsp)
 end
 
-# Locals (not globals) so Julia/Enzyme see concrete types.
-function main()
+function main(; show_figures::Bool = isinteractive())
     seed!(42)
 
     γ64_Hz = 42.57747892e6
@@ -83,7 +76,8 @@ function main()
 
     @info "Setup" Nt Nspins n_ctrl n_rf_active=length(rf_active_idx)
 
-    interp = build_interpolation_tables(n_ctrl, rf_active_idx)
+    TL_interp = (t = Float32.(seqd.t[1:Nt]),)
+    interp = build_rf_event_interpolation_tables(seq, TL_interp, n_ctrl, rf_active_idx)
     csr = build_csr_gather_tables(n_ctrl, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
 
     B1_timeline = zeros(ComplexF64, Nt)
@@ -91,7 +85,6 @@ function main()
     gx = zeros(Float64, n_ctrl)
     gi = zeros(Float64, n_ctrl)
 
-    # Enzyme shadows: ∇B1 in B1 slot; zero arrays elsewhere keep activity consistent.
     seqd_primal = DiscreteSequence(seqd.Gx, seqd.Gy, seqd.Gz, B1_timeline,
                                    seqd.Δf, seqd.ψ, seqd.ADC, seqd.t, seqd.Δt)
     seqd_shadow = DiscreteSequence(zero(seqd.Gx), zero(seqd.Gy), zero(seqd.Gz),
@@ -117,7 +110,7 @@ function main()
         dM_z = zeros(Float64, Nspins)
 
         result = Enzyme.autodiff(
-            Enzyme.ReverseWithPrimal,
+            Enzyme.set_runtime_activity(Enzyme.ReverseWithPrimal),
             loss!,
             Enzyme.Active,
             Enzyme.Duplicated(M_xy, dM_xy),
@@ -131,7 +124,7 @@ function main()
         return result[2]
     end
 
-    # GD with step capped by gradient RMS.
+    # GD with step capped by gradient RMS
     Niters = 20
     η_base = 3e-9
     LOG_EVERY = 10
@@ -178,10 +171,10 @@ function main()
     lines!(ax2, z_mm, target_mag, color=:black, linestyle=:dash, label="Target")
     axislegend(ax2, position=:rt)
 
-    outdir = "pulses/simple_cpu"
+    outdir = joinpath(@__DIR__, "pulses", "simple_cpu")
     mkpath(outdir)
     save(joinpath(outdir, "simple_cpu.png"), fig, px_per_unit=4)
-    display(fig)
+    show_figures && display(fig)
 
     Δt_rf = 10e-6
     seq.RF[1].A .= ComplexF32.(x_r .+ im .* x_i)
@@ -194,4 +187,6 @@ function main()
     @info "Saved pulse to $outdir"
 end
 
-main()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    main()
+end

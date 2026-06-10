@@ -2,10 +2,10 @@
 # backend ∈ (:cpu, :reactant_gpu, :cuda). :cuda lazily installs CUDA.jl (not in [deps]).
 
 using Pkg
-Pkg.activate(".")
+Pkg.activate(@__DIR__)
 Pkg.instantiate()
 
-include("utils.jl")
+include(joinpath(@__DIR__, "utils.jl"))
 
 using KomaMRICore
 using CairoMakie, LaTeXStrings
@@ -56,7 +56,8 @@ end
 
 # `CUDA`/`CuArray` resolve at call time; call this via Base.invokelatest after CUDA is loaded.
 function _run_cuda_pipeline(; Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
-                            target_profile, mask_f32, INVN, Niters, λ0, img_path)
+                            target_profile, mask_f32, INVN, interp_h, csr_h,
+                            Niters, λ0, img_path)
     adapt_dev(x) = CUDA.adapt(CuArray, x)
     ka_backend = CUDA.CUDABackend()
     group_size = 256
@@ -71,7 +72,7 @@ function _run_cuda_pipeline(; Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
     @info "[$(basename(img_path))] Setting up CUDA backend (native KA + Enzyme)..."
     bs = init_bloch_setup(;
         Nspins, n_ctrl, TL, rf_idx, spin=spin_params,
-        to_device=adapt_dev, backend=ka_backend, group_size)
+        interp=interp_h, csr=csr_h, to_device=adapt_dev, backend=ka_backend, group_size)
 
     target_d = adapt_dev(ComplexF32.(target_profile))
     mask_d = adapt_dev(mask_f32)
@@ -104,7 +105,11 @@ function _run_cuda_pipeline(; Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
     return x_opt, M_xy_achieved, loss_history, performed_iterations
 end
 
-function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_logo.png")
+function main(;
+    backend::Symbol = :cpu,
+    img_path::String = joinpath(@__DIR__, "targets", "stanford_logo.png"),
+    show_figures::Bool = isinteractive(),
+)
     if backend in (:cpu, :reactant_gpu)
         Reactant.set_default_backend(backend == :cpu ? "cpu" : "cuda")
     elseif backend != :cuda
@@ -136,7 +141,7 @@ function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_log
     TL = discretize_timeline(seq, sim_params)
     rf_idx = TL.rf_active_idx
     n_ctrl = Nrf
-    interp_h = build_interpolation_tables(n_ctrl, rf_idx)
+    interp_h = build_rf_event_interpolation_tables(seq, TL, n_ctrl, rf_idx)
     csr_h = build_csr_gather_tables(n_ctrl, interp_h.j_lo, interp_h.j_hi, interp_h.w0, interp_h.w1)
 
     spin_params = (
@@ -162,7 +167,7 @@ function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_log
         x_opt, M_xy_achieved, loss_history, performed_iterations = Base.invokelatest(
             _run_cuda_pipeline;
             Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
-            target_profile, mask_f32, INVN, Niters, λ0, img_path)
+            target_profile, mask_f32, INVN, interp_h, csr_h, Niters, λ0, img_path)
     else
         x_opt, M_xy_achieved, loss_history, performed_iterations = _run_reactant_pipeline(;
             Nrf, Nspins, n_ctrl, TL, rf_idx, spin_params,
@@ -173,7 +178,7 @@ function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_log
     seq.RF[1].A .= x_opt
 
     stem = splitext(basename(img_path))[1]
-    outdir = joinpath("pulses", stem)
+    outdir = joinpath(@__DIR__, "pulses", stem)
     mkpath(outdir)
 
     t_ms = collect(range(0, Trf, Nrf)) .* 1e3
@@ -183,7 +188,7 @@ function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_log
     lines!(axrf, t_ms, imag(x_opt) .* 1e6, color = :red, label = "Imag")
     axislegend(axrf, position = :rt)
     save(joinpath(outdir, "RF_2D_optimized_RF.png"), fig_rf, px_per_unit = 4)
-    display(fig_rf)
+    show_figures && display(fig_rf)
 
     mask_2d = reshape(mask_f32, Nspins_x, Nspins_y)
 
@@ -208,7 +213,7 @@ function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_log
     hm_a.colorrange[] = (0.0, cl_hi)
 
     save(joinpath(outdir, "RF_2D_image_profile.png"), fig_prof, px_per_unit=4)
-    display(fig_prof)
+    show_figures && display(fig_prof)
 
     Δt_rf = 10e-6
     T_seq = (dur(seq) ÷ Δt_rf) * Δt_rf
@@ -221,4 +226,6 @@ function main(; backend::Symbol = :cpu, img_path::String = "targets/stanford_log
     @info "Optimization complete."
 end
 
-main()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    main()
+end

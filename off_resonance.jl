@@ -2,8 +2,9 @@
 # backend ∈ (:cpu, :cuda, :reactant_gpu).
 
 const BACKEND = :cpu
+const SHOW_FIGURES = isinteractive()
 
-include("utils.jl")
+include(joinpath(@__DIR__, "utils.jl"))
 
 if BACKEND == :cuda
     using CUDA
@@ -29,12 +30,12 @@ const γ = γ_Hz
 
 # B0 source
 const B0_SOURCE = :gaussian # :gaussian, :dicom, or :hz_file
-const DICOM_B0_PATH = "data/b0maps/in_vivo_phase.dcm"
+const DICOM_B0_PATH = nothing
 
 const B0_PEAK_HZ = 80.0
 const B0_SIGMA_M = nothing
 
-const HZ_FILE_PATH = "data/b0maps/b0_hz.jld2"
+const HZ_FILE_PATH = nothing
 const HZ_FILE_KEY = "Δf_hz"
 const HZ_FILE_FOV = 250e-3
 const HZ_FILE_SCALE = 1.0
@@ -43,7 +44,7 @@ const DICOM_DELTA_TE = 5e-3
 const DICOM_B0_TESLA = 3.0
 const DICOM_SCALE_FACTOR = 1.0
 const DICOM_SMOOTH_SIGMA = 0.0
-const DICOM_MAG_PATH = "data/b0maps/in_vivo_mag.dcm"
+const DICOM_MAG_PATH = nothing
 const DICOM_MAG_THRESHOLD = 0.1
 const DICOM_UNWRAP_PHASE = :auto
 
@@ -72,7 +73,7 @@ function read_dicom_fov_meters(path::String)
     return max(fov_x, fov_y)
 end
 
-# 2D phase unwrap via DCT Poisson solver (Neumann BC).
+# 2D phase unwrap via DCT Poisson solver
 function unwrap_phase_2d(wrapped::AbstractMatrix{<:AbstractFloat})
     M, N = size(wrapped)
     T = eltype(wrapped)
@@ -183,8 +184,7 @@ function load_b0_from_hz_file(file_path::String, sim_xs, sim_ys;
         Float64.(data[jld2_key])
     elseif ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
         img = Images.load(file_path)
-        img_gray = eltype(img) <: Images.AbstractRGB ? Images.Gray.(img) : img
-        Float64.(img_gray)
+        Float64.(Images.Gray.(img)) .* Float64.(Images.alpha.(img))
     else
         error("Unsupported file format: $ext. Use .jld2 or an image file")
     end
@@ -220,7 +220,8 @@ seq, Trf = build_spiral_sequence(; Nrf)
 seq.GR[1].A = seq.GR[1].A ./ 2
 seq.GR[2].A = seq.GR[2].A ./ 2
 
-Nspins_x = 80; Nspins_y = 80
+Nspins_x = 80
+Nspins_y = 80
 xs = range(-FOV_sim/2, FOV_sim/2, Nspins_x)
 ys = range(-FOV_sim/2, FOV_sim/2, Nspins_y)
 xgrid = Float32.(vec(repeat(collect(xs),  1, Nspins_y)))
@@ -238,7 +239,7 @@ mask = [sqrt(x^2 + y^2) <= FOV_sim/2.2 for x in xs, y in ys][:]
 const TL = discretize_timeline(seq, sim_params)
 const rf_idx = TL.rf_active_idx
 const n_ctrl = length(seq.RF[1].A)
-const interp_h = build_interpolation_tables(n_ctrl, rf_idx)
+const interp_h = build_rf_event_interpolation_tables(seq, TL, n_ctrl, rf_idx)
 const csr_h = build_csr_gather_tables(n_ctrl, interp_h.j_lo, interp_h.j_hi, interp_h.w0, interp_h.w1)
 
 make_spin_params(ΔBz) = (
@@ -249,7 +250,7 @@ make_spin_params(ΔBz) = (
     p_ρ = ones(Float32, Nspins),
 )
 
-img_path = "targets/stanford_logo.png"
+img_path = joinpath(@__DIR__, "targets", "stanford_logo.png")
 target_profile, mag_target_2d = load_image_target(img_path, Nspins_x, Nspins_y)
 
 INVN = inv(Float32(Nspins))
@@ -273,6 +274,7 @@ function run_b0_optimization(ΔBz_vec, x0, Niters, λ0; log_every=0)
 
         bs = init_bloch_setup(;
             Nspins, n_ctrl, TL, rf_idx, spin,
+            interp=interp_h, csr=csr_h,
             to_device=adapt_dev, backend=ka_backend, group_size)
         fill!(bs.s_Δf, 0.0f0)
 
@@ -345,7 +347,7 @@ function load_b0()
     end
 end
 
-outdir = "pulses/off_resonance"
+outdir = joinpath(@__DIR__, "pulses", "off_resonance")
 mkpath(outdir)
 
 x0 = 1f-7 .* randn(ComplexF32, Nrf)
@@ -372,7 +374,7 @@ jldsave(joinpath(outdir, "b0_ignorant.jld2");
 @info "Optimization WITH B0"
 t0 = time()
 x_opt, loss_history, n_iters, fwd_b0 = run_b0_optimization(
-    ΔBz_h, copy(x0), N_ITERS, LAMBDA_0; log_every=LOG_EVERY)
+    ΔBz_h, x0, N_ITERS, LAMBDA_0; log_every=LOG_EVERY)
 @info "Done in $(round(time()-t0, digits=2))s, loss: $(loss_history[n_iters])"
 
 # Forward-evaluate both pulses against the true B0 field.
@@ -421,8 +423,7 @@ lines!(ax6, t_ms, real(x_opt) .* 1e6, color=:blue, label="Real")
 lines!(ax6, t_ms, imag(x_opt) .* 1e6, color=:red,  label="Imag")
 axislegend(ax6, position=:rt)
 
-cl_hi = max(maximum(abs.(mag_target_2d)),
-            maximum(achieved_2d),
+cl_hi = max(maximum(abs.(mag_target_2d)), maximum(achieved_2d),
             maximum(achieved_no_b0_with_b0))
 hm1.colorrange[] = (0.0, cl_hi)
 hm3.colorrange[] = (0.0, cl_hi)
@@ -430,9 +431,9 @@ hm4.colorrange[] = (0.0, cl_hi)
 
 fig_path = joinpath(outdir, "results.png")
 save(fig_path, fig, px_per_unit=3)
-display(fig)
+SHOW_FIGURES && display(fig)
 @info "Saved $fig_path"
 
-include("pulseq_utils/logo_gre.jl")
+include(joinpath(@__DIR__, "pulseq_utils", "logo_gre.jl"))
 generate_logo_gre_seq(joinpath(outdir, "b0_ignorant.jld2"), joinpath(outdir, "b0_ignorant.seq"))
-generate_logo_gre_seq(joinpath(outdir, "b0_aware.jld2"),    joinpath(outdir, "b0_aware.seq"))
+generate_logo_gre_seq(joinpath(outdir, "b0_aware.jld2"), joinpath(outdir, "b0_aware.seq"))
