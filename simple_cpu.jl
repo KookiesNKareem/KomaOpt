@@ -35,7 +35,14 @@ function loss!(M_xy::AbstractVector{ComplexF64}, M_z::AbstractVector{Float64},
         BlochSimple(), 1, KA.CPU(), KomaMRICore.DefaultPrealloc{Float64}(),
     )
 
-    return 0.5 * invN * sum(i -> abs2(@inbounds M_xy[i] - im*target_mag[i]), 1:Nsp)
+    acc = 0.0
+    @inbounds for i in 1:Nsp
+        m = M_xy[i]
+        dr = real(m)
+        di = imag(m) - target_mag[i]
+        acc += dr * dr + di * di
+    end
+    return 0.5 * invN * acc
 end
 
 function main(; show_figures::Bool = isinteractive())
@@ -84,6 +91,10 @@ function main(; show_figures::Bool = isinteractive())
     ∇B1 = zeros(ComplexF64, Nt)
     gx = zeros(Float64, n_ctrl)
     gi = zeros(Float64, n_ctrl)
+    M_xy = zeros(ComplexF64, Nspins)
+    M_z = ones(Float64, Nspins)
+    dM_xy = zeros(ComplexF64, Nspins)
+    dM_z = zeros(Float64, Nspins)
 
     seqd_primal = DiscreteSequence(seqd.Gx, seqd.Gy, seqd.Gz, B1_timeline,
                                    seqd.Δf, seqd.ψ, seqd.ADC, seqd.t, seqd.Δt)
@@ -103,11 +114,8 @@ function main(; show_figures::Bool = isinteractive())
     function gradient!(x_r::Vector{Float64}, x_i::Vector{Float64})
         cpu_map_ctrl_to_B1!(B1_timeline, x_r, x_i, interp.idx_rf, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
         fill!(∇B1, 0)
-
-        M_xy = zeros(ComplexF64, Nspins)
-        M_z = ones(Float64, Nspins)
-        dM_xy = zeros(ComplexF64, Nspins)
-        dM_z = zeros(Float64, Nspins)
+        fill!(dM_xy, 0)
+        fill!(dM_z, 0)
 
         result = Enzyme.autodiff(
             Enzyme.set_runtime_activity(Enzyme.ReverseWithPrimal),
@@ -139,7 +147,11 @@ function main(; show_figures::Bool = isinteractive())
         n_performed = k
         losses[k] = gradient!(x_r, x_i)
 
-        g_rms = sqrt((sum(gx.^2) + sum(gi.^2)) / (2*n_ctrl)) + 1e-20
+        g_norm2 = 0.0
+        @inbounds for j in 1:n_ctrl
+            g_norm2 += gx[j] * gx[j] + gi[j] * gi[j]
+        end
+        g_rms = sqrt(g_norm2 / (2*n_ctrl)) + 1e-20
 
         η = min(η_base, 1e-6 / (10.0 * g_rms))
         @inbounds for j in 1:n_ctrl
