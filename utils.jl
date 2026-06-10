@@ -8,6 +8,7 @@ using ReactantCore: @trace
 import Enzyme
 using Enzyme: gradient, ReverseWithPrimal, Const
 using FFTW, FileIO
+using Images: Gray, alpha
 import ImageTransformations
 
 Reactant.allowscalar(true)
@@ -44,6 +45,54 @@ function build_interpolation_tables(n_ctrl::Int, rf_idx::Vector{Int})
         end
         idx_rf[k] = idx
     end
+    return (j_lo=j_lo, j_hi=j_hi, w0=w0, w1=w1, idx_rf=idx_rf)
+end
+
+function build_rf_event_interpolation_tables(seq, TL, n_ctrl::Int, rf_idx::Vector{Int}; rf_block_idx::Int=1)
+    rf = seq.RF[rf_block_idx]
+    rf_times = Float64.(times(rf))
+    @inbounds for i in 2:length(rf_times)
+        rf_times[i] <= rf_times[i-1] && (rf_times[i] = nextfloat(rf_times[i-1]))
+    end
+
+    # Koma samples vector RF events as [0; A; 0]. Control samples therefore
+    # occupy knots 2:(n_ctrl+1), with duplicated start/end knots moved above.
+    ctrl_times = rf_times[2:(n_ctrl + 1)]
+    tl_times = Float64.(TL.t[rf_idx])
+
+    j_lo = Vector{Int}(undef, length(rf_idx))
+    j_hi = Vector{Int}(undef, length(rf_idx))
+    w0 = Vector{Float64}(undef, length(rf_idx))
+    w1 = Vector{Float64}(undef, length(rf_idx))
+    idx_rf = Vector{Int}(undef, length(rf_idx))
+
+    j = 1
+    @inbounds for (k, idx) in enumerate(rf_idx)
+        t = tl_times[k]
+        while j < n_ctrl && ctrl_times[j+1] < t
+            j += 1
+        end
+        if t <= ctrl_times[1]
+            j_lo[k] = 1
+            j_hi[k] = 1
+            w0[k] = 1.0
+            w1[k] = 0.0
+        elseif j == n_ctrl
+            j_lo[k] = n_ctrl
+            j_hi[k] = n_ctrl
+            w0[k] = 1.0
+            w1[k] = 0.0
+        else
+            denom = ctrl_times[j+1] - ctrl_times[j]
+            α = (t - ctrl_times[j]) / (denom + 1e-30)
+            j_lo[k] = j
+            j_hi[k] = j + 1
+            w0[k] = 1.0 - α
+            w1[k] = α
+        end
+        idx_rf[k] = idx
+    end
+
     return (j_lo=j_lo, j_hi=j_hi, w0=w0, w1=w1, idx_rf=idx_rf)
 end
 
@@ -162,8 +211,10 @@ end
 
 function load_image_target(img_path, Nspins_x, Nspins_y; radius_px=20, scale=0.5f0)
     img = load(img_path)
-    img_bw = reverse(getproperty.(img', :b) .* 1.0, dims=2)
-    img_bw .= img_bw ./ maximum(img_bw)
+    img_bw = reverse(Float32.(Gray.(img')) .* Float32.(alpha.(img')), dims=2)
+    img_max = maximum(img_bw)
+    img_max > 0 || error("Target image $img_path is blank after grayscale/alpha conversion")
+    img_bw ./= img_max
 
     # Gaussian-windowed low-pass filter in frequency domain
     cx, cy = size(img_bw) .÷ 2 .+ 1
@@ -223,19 +274,21 @@ end
 
 function bloch_forward_reactant!(
     M_xy_r, M_xy_i, M_z,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
     s_B1_r, s_B1_i,
     ::Val{N_Δt}
 ) where {N_Δt}
     neg_pi_gamma_local = Float32(-π * γ_Hz)
-    inv_γ_rad = 1.0f0 / Float32(γ_rad)
+    # Δf is stored in Hz; effective Bz from demod is Δf/γ_Hz (Tesla). Earlier we
+    # divided by γ_rad which is off by 2π — silently OK only when Δf == 0.
+    inv_γ_Hz = 1.0f0 / Float32(γ_Hz)
 
     @trace for s_idx in 1:N_Δt
         Bz = @. p_x * s_Gx[s_idx] + p_y * s_Gy[s_idx] + p_z * s_Gz[s_idx] +
-                p_ΔBz - s_Δf[s_idx] * inv_γ_rad
-        B1_r = s_B1_r[s_idx]
-        B1_i = s_B1_i[s_idx]
+                p_ΔBz - s_Δf[s_idx] * inv_γ_Hz
+        B1_r = @. s_B1_r[s_idx] * p_B1_scale
+        B1_i = @. s_B1_i[s_idx] * p_B1_scale
         Δt = s_Δt[s_idx]
 
         B = @. sqrt(B1_r^2 + B1_i^2 + Bz^2) + 1f-20
@@ -272,18 +325,18 @@ end
 
 function reactant_loss_mxy(
     B1_r_tl, B1_i_tl,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
     target_r, target_i, mask, invN,
     ::Val{N_Δt}
 ) where {N_Δt}
     M_xy_r = zero(p_x)
     M_xy_i = zero(p_x)
-    M_z = one.(p_x)
+    M_z = @. p_ρ + zero(p_x)
 
     M_xy_r, M_xy_i, M_z = bloch_forward_reactant!(
         M_xy_r, M_xy_i, M_z,
-        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
         B1_r_tl, B1_i_tl, Val(N_Δt))
 
@@ -294,7 +347,7 @@ end
 
 function reactant_grad_and_loss_mxy(
     B1_r_tl, B1_i_tl,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
     target_r, target_i, mask, invN,
     ::Val{N_Δt}
@@ -305,7 +358,7 @@ function reactant_grad_and_loss_mxy(
         B1_r_tl, B1_i_tl,
         Const(p_x), Const(p_y), Const(p_z),
         Const(p_ΔBz), Const(p_T1), Const(p_T2),
-        Const(p_ρ),
+        Const(p_ρ), Const(p_B1_scale),
         Const(s_Gx), Const(s_Gy), Const(s_Gz),
         Const(s_Δt), Const(s_Δf),
         Const(target_r), Const(target_i),
@@ -314,35 +367,35 @@ function reactant_grad_and_loss_mxy(
     return val, derivs[1], derivs[2]
 end
 
-# Mz-target loss for Reactant compilation. Applies T1 recovery `E1 = exp(-T_delay/T1)`
-# to M_z before computing the loss: M_z_delayed = M_z * E1 + ρ * (1 - E1).
+# Mz-target loss for Reactant compilation. Applies optional post-pulse recovery
+# to M_z before computing the loss: M_z_delayed = M_z * E1 + recovery_ρ * (1 - E1).
 function reactant_loss_mz(
     B1_r_tl, B1_i_tl,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
-    target_z, mask, invN, E1_delay,
+    target_z, mask, invN, E1_delay, recovery_ρ,
     ::Val{N_Δt}
 ) where {N_Δt}
     M_xy_r = zero(p_x)
     M_xy_i = zero(p_x)
-    M_z = one.(p_x)
+    M_z = @. p_ρ + zero(p_x)
 
     M_xy_r, M_xy_i, M_z = bloch_forward_reactant!(
         M_xy_r, M_xy_i, M_z,
-        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
         B1_r_tl, B1_i_tl, Val(N_Δt))
 
-    M_z_delayed = @. M_z * E1_delay + p_ρ * (1f0 - E1_delay)
+    M_z_delayed = @. M_z * E1_delay + recovery_ρ * (1f0 - E1_delay)
     d = @. (M_z_delayed - target_z) * mask
     return sum(@. invN * d^2)
 end
 
 function reactant_grad_and_loss_mz(
     B1_r_tl, B1_i_tl,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
-    target_z, mask, invN, E1_delay,
+    target_z, mask, invN, E1_delay, recovery_ρ,
     ::Val{N_Δt}
 ) where {N_Δt}
     (; val, derivs) = gradient(
@@ -351,27 +404,27 @@ function reactant_grad_and_loss_mz(
         B1_r_tl, B1_i_tl,
         Const(p_x), Const(p_y), Const(p_z),
         Const(p_ΔBz), Const(p_T1), Const(p_T2),
-        Const(p_ρ),
+        Const(p_ρ), Const(p_B1_scale),
         Const(s_Gx), Const(s_Gy), Const(s_Gz),
         Const(s_Δt), Const(s_Δf),
-        Const(target_z), Const(mask), Const(invN), Const(E1_delay),
+        Const(target_z), Const(mask), Const(invN), Const(E1_delay), Const(recovery_ρ),
         Const(Val(N_Δt)))
     return val, derivs[1], derivs[2]
 end
 
 function reactant_forward(
     B1_r_tl, B1_i_tl,
-    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+    p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
     s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
     ::Val{N_Δt}
 ) where {N_Δt}
     M_xy_r = zero(p_x)
     M_xy_i = zero(p_x)
-    M_z = one.(p_x)
+    M_z = @. p_ρ + zero(p_x)
 
     M_xy_r, M_xy_i, M_z = bloch_forward_reactant!(
         M_xy_r, M_xy_i, M_z,
-        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ,
+        p_x, p_y, p_z, p_ΔBz, p_T1, p_T2, p_ρ, p_B1_scale,
         s_Gx, s_Gy, s_Gz, s_Δt, s_Δf,
         B1_r_tl, B1_i_tl, Val(N_Δt))
 
@@ -400,6 +453,7 @@ function setup_reactant_backend(;
     interp = nothing,
     csr = nothing,
     E1_delay = nothing,
+    recovery_ρ = nothing,
 )
     Nt = Int(TL.Nt32)
     N_Δt_val = Val(Nt)
@@ -418,6 +472,9 @@ function setup_reactant_backend(;
     p_T1_ra = Reactant.to_rarray(Float32.(spin.p_T1))
     p_T2_ra = Reactant.to_rarray(Float32.(spin.p_T2))
     p_ρ_ra = Reactant.to_rarray(Float32.(spin.p_ρ))
+    p_B1_scale_h = hasproperty(spin, :p_B1_scale) ?
+        Float32.(spin.p_B1_scale) : ones(Float32, Nspins)
+    p_B1_scale_ra = Reactant.to_rarray(p_B1_scale_h)
 
     Gx_ra = Reactant.to_rarray(Float32.(TL.Gx))
     Gy_ra = Reactant.to_rarray(Float32.(TL.Gy))
@@ -432,16 +489,18 @@ function setup_reactant_backend(;
     if loss_mode == :mz
         E1_arr = isnothing(E1_delay) ? ones(Float32, Nspins) : Float32.(E1_delay)
         E1_ra = Reactant.to_rarray(E1_arr)
+        recovery_arr = isnothing(recovery_ρ) ? Float32.(spin.p_ρ) : Float32.(recovery_ρ)
+        recovery_ra = Reactant.to_rarray(recovery_arr)
         target_z_ra = Reactant.to_rarray(Float32.(target))
 
         @info "Compiling Reactant Mz grad_and_loss..."
         compiled_gl = Reactant.@compile sync=true reactant_grad_and_loss_mz(
             B1_r_ra, B1_i_ra,
-            p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra,
+            p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra, p_B1_scale_ra,
             Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra,
-            target_z_ra, mask_ra, invN, E1_ra,
+            target_z_ra, mask_ra, invN, E1_ra, recovery_ra,
             N_Δt_val)
-        target_tuple = (target_z_ra, mask_ra, invN, E1_ra)
+        target_tuple = (target_z_ra, mask_ra, invN, E1_ra, recovery_ra)
     elseif loss_mode == :mxy
         target_r_ra = Reactant.to_rarray(Float32.(real.(target)))
         target_i_ra = Reactant.to_rarray(Float32.(imag.(target)))
@@ -449,7 +508,7 @@ function setup_reactant_backend(;
         @info "Compiling Reactant Mxy grad_and_loss..."
         compiled_gl = Reactant.@compile sync=true reactant_grad_and_loss_mxy(
             B1_r_ra, B1_i_ra,
-            p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra,
+            p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra, p_B1_scale_ra,
             Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra,
             target_r_ra, target_i_ra, mask_ra, invN,
             N_Δt_val)
@@ -460,7 +519,7 @@ function setup_reactant_backend(;
 
     compiled_fwd = Reactant.@compile sync=true reactant_forward(
         B1_r_ra, B1_i_ra,
-        p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra,
+        p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra, p_B1_scale_ra,
         Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra,
         N_Δt_val)
     @info "Reactant compilation complete."
@@ -470,7 +529,7 @@ function setup_reactant_backend(;
     gx_buf = zeros(Float32, n_ctrl)
     gi_buf = zeros(Float32, n_ctrl)
 
-    spin_ra = (p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra)
+    spin_ra = (p_x_ra, p_y_ra, p_z_ra, p_ΔBz_ra, p_T1_ra, p_T2_ra, p_ρ_ra, p_B1_scale_ra)
     seq_ra = (Gx_ra, Gy_ra, Gz_ra, Δt_ra, Δf_ra)
 
     function grad_fn!(x_r::Vector{Float32}, x_i::Vector{Float32})
@@ -524,6 +583,7 @@ function bb_optimize!(
     fill!(gx_prev_d, zero(T));   fill!(gi_prev_d, zero(T))
     x_prev_r_d = similar(x_r_d); x_prev_i_d = similar(x_i_d)
     copyto!(x_prev_r_d, x_r_d);  copyto!(x_prev_i_d, x_i_d)
+    norm_buf_d = similar(gx_d)
 
     λ_prev = T(λ0)
     θ_prev = T(Inf)
@@ -535,11 +595,16 @@ function bb_optimize!(
         f_k = grad_fn!(x_r_d, x_i_d)
         loss_history[k] = Float64(f_k)
 
-        gnorm = sqrt(Float64(sum(gx_d .* gx_d .+ gi_d .* gi_d)))
-        num = sqrt(Float64(sum((x_r_d .- x_prev_r_d) .* (x_r_d .- x_prev_r_d) .+
-                                (x_i_d .- x_prev_i_d) .* (x_i_d .- x_prev_i_d))))
-        den = sqrt(Float64(sum((gx_d .- gx_prev_d) .* (gx_d .- gx_prev_d) .+
-                                (gi_d .- gi_prev_d) .* (gi_d .- gi_prev_d))))
+        @. norm_buf_d = gx_d * gx_d + gi_d * gi_d
+        gnorm = sqrt(Float64(sum(norm_buf_d)))
+
+        @. norm_buf_d = (x_r_d - x_prev_r_d) * (x_r_d - x_prev_r_d) +
+                        (x_i_d - x_prev_i_d) * (x_i_d - x_prev_i_d)
+        num = sqrt(Float64(sum(norm_buf_d)))
+
+        @. norm_buf_d = (gx_d - gx_prev_d) * (gx_d - gx_prev_d) +
+                        (gi_d - gi_prev_d) * (gi_d - gi_prev_d)
+        den = sqrt(Float64(sum(norm_buf_d)))
 
         if !isfinite(f_k) || !isfinite(gnorm)
             @warn "Non-finite loss/gradient; stopping" iter=k loss=f_k gnorm=gnorm
@@ -611,7 +676,7 @@ end
         s_idx = Int32(1)
         while s_idx <= N_Δt
             Bz = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) +
-                 ΔBz - s_Δf[s_idx] / T(γ_rad)
+                 ΔBz - s_Δf[s_idx] / T(γ_Hz)
             B1_r, B1_i = reim(s_B1[s_idx])
             B = sqrt(B1_r^2 + B1_i^2 + Bz^2)
             Δt = s_Δt[s_idx]
@@ -709,7 +774,7 @@ end
     end
 end
 
-# MSE-on-Mxy loss + adjoint seed (atomic accumulation of scalar loss).
+# MSE-on-Mxy loss + adjoint seed
 @kernel inbounds=true function seed_and_loss_kernel!(
     acc::AbstractVector{T},
     dM_xy::AbstractVector{Complex{T}},
@@ -774,9 +839,13 @@ struct BlochSetup{T}
 end
 
 # Upload host interp/csr tables (which are Int/Float64) as Int32/Float32.
-function setup_control_mapping_device(n_ctrl::Int, rf_idx, to_device)
-    interp = build_interpolation_tables(n_ctrl, rf_idx)
-    csr = build_csr_gather_tables(n_ctrl, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
+function setup_control_mapping_device(n_ctrl::Int, rf_idx, to_device; interp=nothing, csr=nothing)
+    if isnothing(interp)
+        interp = build_interpolation_tables(n_ctrl, rf_idx)
+    end
+    if isnothing(csr)
+        csr = build_csr_gather_tables(n_ctrl, interp.j_lo, interp.j_hi, interp.w0, interp.w1)
+    end
     return (
         interp_tables = interp,
         csr_tables = csr,
@@ -796,9 +865,11 @@ function init_bloch_setup(;
     TL, rf_idx::Vector{Int},
     spin,
     to_device, backend,
+    interp = nothing,
+    csr = nothing,
     group_size::Int = 256,
 )
-    cm = setup_control_mapping_device(n_ctrl, rf_idx, to_device)
+    cm = setup_control_mapping_device(n_ctrl, rf_idx, to_device; interp, csr)
     BlochSetup{Float32}(
         to_device(zeros(ComplexF32, Nspins)),
         to_device(ones(Float32, Nspins)),
@@ -834,18 +905,21 @@ function grad_and_loss!(bs::BlochSetup, x_r_d, x_i_d, seed_fn!;
         bs.idx_rf_d, bs.j_lo_d, bs.j_hi_d, bs.w0_d, bs.w1_d,
         sign_r, sign_i; ndrange = bs.n_rf)
 
-    fill!(bs.M_xy, ComplexF32(0)); fill!(bs.M_z, 1.0f0)
+    fill!(bs.M_xy, ComplexF32(0))
+    copyto!(bs.M_z, bs.p_ρ)
     excite_only!(bs.M_xy, bs.M_z,
         bs.p_x, bs.p_y, bs.p_z, bs.p_ΔBz, bs.p_T1, bs.p_T2, bs.p_ρ,
         bs.Nspins, bs.s_Gx, bs.s_Gy, bs.s_Gz, bs.s_Δt, bs.s_Δf, bs.s_B1,
         bs.N_Δt, Val(false), bs.backend, bs.group_size)
 
     fill!(bs.acc_loss_d, 0f0)
-    fill!(bs.dM_xy, ComplexF32(0)); fill!(bs.dM_z, 0f0)
+    fill!(bs.dM_xy, ComplexF32(0))
+    fill!(bs.dM_z, 0f0)
     fill!(bs.∇B1, ComplexF32(0))
     seed_fn!(bs)
 
-    fill!(bs.M_xy, ComplexF32(0)); fill!(bs.M_z, 1.0f0)
+    fill!(bs.M_xy, ComplexF32(0))
+    copyto!(bs.M_z, bs.p_ρ)
     Enzyme.autodiff(
         Enzyme.set_runtime_activity(Enzyme.Reverse),
         excite_only!,
@@ -863,7 +937,8 @@ function grad_and_loss!(bs::BlochSetup, x_r_d, x_i_d, seed_fn!;
         Enzyme.Const(bs.backend),
     )
 
-    fill!(bs.gx_d, 0f0); fill!(bs.gi_d, 0f0)
+    fill!(bs.gx_d, 0f0)
+    fill!(bs.gi_d, 0f0)
     gather_ctrl_grads_kernel!(bs.backend, bs.group_size)(
         bs.gx_d, bs.gi_d, bs.∇B1,
         bs.idx_rf_d, bs.csr_ptr_d, bs.csr_idx_d, bs.csr_w_d;
@@ -878,7 +953,10 @@ function forward_sim!(bs::BlochSetup, x_r_d, x_i_d;
         bs.s_B1, x_r_d, x_i_d,
         bs.idx_rf_d, bs.j_lo_d, bs.j_hi_d, bs.w0_d, bs.w1_d,
         sign_r, sign_i; ndrange = bs.n_rf)
-    fill!(bs.M_xy, ComplexF32(0)); fill!(bs.M_z, 1.0f0)
+
+    fill!(bs.M_xy, ComplexF32(0))
+    copyto!(bs.M_z, bs.p_ρ)
+
     excite_only!(bs.M_xy, bs.M_z,
         bs.p_x, bs.p_y, bs.p_z, bs.p_ΔBz, bs.p_T1, bs.p_T2, bs.p_ρ,
         bs.Nspins, bs.s_Gx, bs.s_Gy, bs.s_Gz, bs.s_Δt, bs.s_Δf, bs.s_B1,
