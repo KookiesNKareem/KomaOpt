@@ -257,13 +257,14 @@ INVN = inv(Float32(Nspins))
 mask_f32 = Float32.(mask)
 
 # Soft B1 penalty: λ * Σ max(|x| - B1max, 0)^2
-function add_b1_amp_penalty!(gx, gi, x_r, x_i, B1_max::Float32, λ::Float32)
-    amp = sqrt.(x_r .^ 2 .+ x_i .^ 2) .+ 1f-20
-    excess = max.(amp .- B1_max, 0f0)
+function add_b1_amp_penalty!(gx, gi, x_r, x_i, amp, excess, B1_max::Float32, λ::Float32)
+    @. amp = sqrt(x_r^2 + x_i^2) + 1f-20
+    @. excess = max(amp - B1_max, 0f0)
     coeff = 2f0 * λ
-    gx .+= coeff .* excess .* x_r ./ amp
-    gi .+= coeff .* excess .* x_i ./ amp
-    return Float64(λ * sum(excess .^ 2))
+    @. gx += coeff * excess * x_r / amp
+    @. gi += coeff * excess * x_i / amp
+    @. amp = excess * excess
+    return Float64(λ * sum(amp))
 end
 
 function run_b0_optimization(ΔBz_vec, x0, Niters, λ0; log_every=0)
@@ -309,10 +310,12 @@ function run_b0_optimization(ΔBz_vec, x0, Niters, λ0; log_every=0)
         x_r = Float32.(real.(x0))
         x_i = Float32.(imag.(x0))
     end
+    amp_buf = similar(x_r)
+    excess_buf = similar(x_r)
 
     grad_fn_with_penalty! = (xr, xi) -> begin
         loss = grad_fn!(xr, xi)
-        loss += add_b1_amp_penalty!(gx_buf, gi_buf, xr, xi, B1_MAX, LAMBDA_AMP)
+        loss += add_b1_amp_penalty!(gx_buf, gi_buf, xr, xi, amp_buf, excess_buf, B1_MAX, LAMBDA_AMP)
         return loss
     end
 
