@@ -6,8 +6,7 @@ using Random
 include("gre.jl")
 include("excitation.jl")
 
-function generate_bssfp_seq(prep_fn::String, output_fn::String;
-                             disable_prep::Bool=false)
+function generate_bssfp_seq(prep_fn::String, output_fn::String; disable_prep::Bool=false, randomize_lines::Bool=true)
     #### Settings ####
     fov = (0.256, 0.256, 0.01) # m
     matrix = (128, 128, 1)
@@ -15,7 +14,7 @@ function generate_bssfp_seq(prep_fn::String, output_fn::String;
     BW_ro = 2000.0 # Hz
     BW_rf = nothing # Hz
 
-    trig_delay = 0.5
+    trig_delay = 1
     lines_per_trigger = 5
     n_ramp = 13
 
@@ -117,10 +116,17 @@ function generate_bssfp_seq(prep_fn::String, output_fn::String;
     M_spoiler = prep_spoil_moment / (γ * 2π) / fov[3]
     T_sp, ζ_sp = _lobe_timing(M_spoiler, sys)
     spoiler = Sequence()
-    @addblock spoiler += (z = Grad(M_spoiler / (T_sp + ζ_sp), T_sp, ζ_sp))
+    if disable_prep
+        @addblock spoiler += (z = 0 * Grad(M_spoiler / (T_sp + ζ_sp), T_sp, ζ_sp))
+    else
+        @addblock spoiler += (z = Grad(M_spoiler / (T_sp + ζ_sp), T_sp, ζ_sp))
+    end
 
     seq = Sequence(sys)
-    lines = 1:matrix[2]
+    lines = collect(1:matrix[2])
+    if randomize_lines
+        shuffle!(MersenneTwister(0), lines)
+    end
 
     @addblocks check_timing = true for i in 1:lines_per_trigger:matrix[2]
         line_subset = i:min(i + lines_per_trigger - 1, matrix[2])
